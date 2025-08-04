@@ -141,7 +141,8 @@ Completion:`;
 
 // Get Gemini completion
 async function getGeminiCompletion(apiKey, prompt) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  // Updated endpoint for Gemini 1.5 Flash
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
   
   try {
     const response = await fetch(endpoint, {
@@ -161,12 +162,18 @@ async function getGeminiCompletion(apiKey, prompt) {
           stopSequences: ['\n\n', 'Context:', 'Partial text:']
         }
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(15000) // Increased timeout
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+      let errorText;
+      try {
+        const errorData = await response.json();
+        errorText = errorData.error?.message || `HTTP ${response.status}`;
+      } catch {
+        errorText = `HTTP ${response.status}`;
+      }
+      throw new Error(`Gemini API error: ${errorText}`);
     }
 
     const data = await response.json();
@@ -174,6 +181,8 @@ async function getGeminiCompletion(apiKey, prompt) {
     if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
       const suggestion = cleanCompletion(data.candidates[0].content.parts[0].text);
       return { success: true, suggestion };
+    } else if (data.error) {
+      throw new Error(`Gemini API error: ${data.error.message}`);
     } else {
       throw new Error('Invalid response from Gemini API');
     }
@@ -206,12 +215,18 @@ async function getOpenAICompletion(apiKey, model, prompt) {
         temperature: 0.7,
         stop: ['\n\n', 'Context:', 'Partial text:']
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(15000)
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
+      let errorText;
+      try {
+        const errorData = await response.json();
+        errorText = errorData.error?.message || `HTTP ${response.status}`;
+      } catch {
+        errorText = `HTTP ${response.status}`;
+      }
+      throw new Error(`OpenAI API error: ${errorText}`);
     }
 
     const data = await response.json();
@@ -250,7 +265,9 @@ async function handleTestApiConnection(message, sendResponse) {
       return;
     }
     
+    console.log(`Testing ${provider} connection...`);
     const result = await testApiConnection(provider, apiKey, model);
+    console.log('Test result:', result);
     sendResponse({ success: result.success, error: result.error });
   } catch (error) {
     console.error('Background: API test failed:', error);
@@ -277,9 +294,12 @@ async function testApiConnection(provider, apiKey, model) {
 
 // Test Gemini API connection
 async function testGeminiConnection(apiKey, prompt) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  // Use the same endpoint as the main function
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
   
   try {
+    console.log('Testing Gemini with endpoint:', endpoint);
+    
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -296,22 +316,35 @@ async function testGeminiConnection(apiKey, prompt) {
           temperature: 0.7
         }
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(15000)
     });
 
+    console.log('Gemini response status:', response.status);
+
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+      let errorText;
+      try {
+        const errorData = await response.json();
+        console.log('Gemini error data:', errorData);
+        errorText = errorData.error?.message || `HTTP ${response.status}`;
+      } catch {
+        errorText = `HTTP ${response.status}`;
+      }
+      throw new Error(`Gemini API error: ${errorText}`);
     }
 
     const data = await response.json();
+    console.log('Gemini response data:', data);
     
     if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
       return { success: true, response: data.candidates[0].content.parts[0].text };
+    } else if (data.error) {
+      throw new Error(`Gemini API error: ${data.error.message}`);
     } else {
       throw new Error('Invalid response from Gemini API');
     }
   } catch (error) {
+    console.error('Gemini test error:', error);
     if (error.name === 'AbortError') {
       throw new Error('Request timeout - check your internet connection');
     }
@@ -339,12 +372,18 @@ async function testOpenAIConnection(apiKey, model, prompt) {
         max_tokens: 50,
         temperature: 0.7
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(15000)
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
+      let errorText;
+      try {
+        const errorData = await response.json();
+        errorText = errorData.error?.message || `HTTP ${response.status}`;
+      } catch {
+        errorText = `HTTP ${response.status}`;
+      }
+      throw new Error(`OpenAI API error: ${errorText}`);
     }
 
     const data = await response.json();
