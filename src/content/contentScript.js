@@ -6,7 +6,236 @@
 // Mark as injected to prevent double injection
 window.emailCopilotInjected = true;
 
-// Import utilities (these will be bundled by Vite)
+// Gmail Observer class
+class GmailObserver {
+  constructor() {
+    this.observer = null;
+    this.observedElements = new Set();
+    this.onComposeDetected = null;
+    this.onComposeRemoved = null;
+    this.isObserving = false;
+  }
+
+  startObserving() {
+    if (this.isObserving) return;
+
+    this.observer = new MutationObserver((mutations) => {
+      this.handleMutations(mutations);
+    });
+
+    this.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['contenteditable', 'role', 'aria-label']
+    });
+
+    this.isObserving = true;
+    console.log('Gmail Observer: Started observing');
+  }
+
+  handleMutations(mutations) {
+    for (const mutation of mutations) {
+      if (mutation.type === 'childList') {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            this.checkForComposeElements(node);
+          }
+        });
+      }
+    }
+  }
+
+  checkForComposeElements(element) {
+    if (this.isComposeElement(element)) {
+      this.handleComposeDetected(element);
+    }
+
+    const composeSelectors = [
+      'div[role="textbox"][aria-label*="message body"]',
+      'div[role="textbox"][aria-label*="Message Body"]',
+      'div[contenteditable="true"][aria-label*="Message"]',
+      'div[contenteditable="true"][role="textbox"]',
+      '.Am.Al.editable'
+    ];
+
+    composeSelectors.forEach(selector => {
+      try {
+        const elements = element.querySelectorAll(selector);
+        elements.forEach(composeElement => {
+          if (this.isComposeElement(composeElement)) {
+            this.handleComposeDetected(composeElement);
+          }
+        });
+      } catch (error) {
+        // Ignore selector errors
+      }
+    });
+  }
+
+  isComposeElement(element) {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+    if (!element.isContentEditable) return false;
+    
+    const ariaLabel = element.getAttribute('aria-label') || '';
+    if (ariaLabel.toLowerCase().includes('message body') || 
+        ariaLabel.toLowerCase().includes('message') ||
+        ariaLabel.toLowerCase().includes('compose')) {
+      return true;
+    }
+
+    if (element.getAttribute('role') === 'textbox') {
+      return true;
+    }
+
+    const gmailClasses = ['Am', 'Al', 'editable'];
+    if (gmailClasses.some(cls => element.classList.contains(cls))) {
+      return true;
+    }
+
+    return false;
+  }
+
+  handleComposeDetected(element) {
+    if (this.observedElements.has(element)) return;
+    
+    console.log('Gmail Observer: Compose element detected', element);
+    this.observedElements.add(element);
+
+    if (this.onComposeDetected) {
+      try {
+        this.onComposeDetected(element);
+      } catch (error) {
+        console.error('Error in compose detected callback:', error);
+      }
+    }
+  }
+}
+
+// Ghost Text Renderer class
+class GhostTextRenderer {
+  constructor() {
+    this.ghostElement = null;
+    this.targetElement = null;
+    this.isVisible = false;
+  }
+
+  show(targetElement, suggestion) {
+    if (!targetElement || !suggestion) return;
+
+    this.targetElement = targetElement;
+    this.hide();
+    
+    this.createGhostElement(suggestion);
+    this.positionGhostElement();
+    this.attachToElement();
+    
+    this.isVisible = true;
+  }
+
+  hide() {
+    if (this.ghostElement) {
+      this.ghostElement.remove();
+      this.ghostElement = null;
+    }
+    
+    this.isVisible = false;
+    this.targetElement = null;
+  }
+
+  createGhostElement(suggestion) {
+    this.ghostElement = document.createElement('div');
+    this.ghostElement.className = 'email-copilot-ghost-text';
+    this.ghostElement.textContent = suggestion;
+  }
+
+  positionGhostElement() {
+    if (!this.ghostElement || !this.targetElement) return;
+
+    const selection = window.getSelection();
+    if (selection.rangeCount === 0) return;
+
+    const range = selection.getRangeAt(0);
+    const tempElement = document.createElement('span');
+    tempElement.textContent = '\u200B';
+    
+    try {
+      range.insertNode(tempElement);
+      const rect = tempElement.getBoundingClientRect();
+      const targetRect = this.targetElement.getBoundingClientRect();
+      
+      this.ghostElement.style.position = 'absolute';
+      this.ghostElement.style.left = `${rect.left - targetRect.left}px`;
+      this.ghostElement.style.top = `${rect.top - targetRect.top}px`;
+      
+      tempElement.remove();
+    } catch (error) {
+      console.error('Failed to position ghost text:', error);
+    }
+  }
+
+  attachToElement() {
+    if (!this.ghostElement || !this.targetElement) return;
+
+    let container = this.targetElement.parentElement;
+    
+    const containerStyle = window.getComputedStyle(container);
+    if (containerStyle.position === 'static') {
+      container.style.position = 'relative';
+    }
+    
+    container.appendChild(this.ghostElement);
+  }
+}
+
+// Keyboard Manager class
+class EmailCopilotKeybinds {
+  constructor() {
+    this.suggestionVisible = false;
+    this.onAcceptSuggestion = null;
+    this.onRejectSuggestion = null;
+    this.onTriggerSuggestion = null;
+  }
+
+  handleKeyEvent(event) {
+    const key = event.key.toLowerCase();
+    
+    if (key === 'tab' && this.suggestionVisible && this.onAcceptSuggestion) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.onAcceptSuggestion(event);
+    } else if (key === 'escape' && this.suggestionVisible && this.onRejectSuggestion) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.onRejectSuggestion(event);
+    } else if (event.ctrlKey && key === ' ' && this.onTriggerSuggestion) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.onTriggerSuggestion(event);
+    } else if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key) && 
+               this.suggestionVisible && this.onRejectSuggestion) {
+      this.onRejectSuggestion(event);
+    }
+  }
+
+  setSuggestionVisible(visible) {
+    this.suggestionVisible = visible;
+  }
+
+  setAcceptCallback(callback) {
+    this.onAcceptSuggestion = callback;
+  }
+
+  setRejectCallback(callback) {
+    this.onRejectSuggestion = callback;
+  }
+
+  setTriggerCallback(callback) {
+    this.onTriggerSuggestion = callback;
+  }
+}
+
+// Main Email Copilot Content class
 class EmailCopilotContent {
   constructor() {
     this.isEnabled = true;
@@ -125,6 +354,7 @@ class EmailCopilotContent {
         outline: none;
         opacity: 0.6;
         transition: opacity 0.2s ease;
+        font-style: italic;
       }
 
       .email-copilot-ghost-text.visible {
@@ -535,9 +765,6 @@ class EmailCopilotContent {
     }
   }
 }
-
-// Include the utility classes inline to avoid import issues
-// ... (include the classes from the other files directly here for simplicity)
 
 // Initialize when DOM is ready
 if (document.readyState === 'loading') {
