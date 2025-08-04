@@ -1,916 +1,1144 @@
 /**
  * Email Copilot Content Script
- * Injects AI-powered autocomplete into Gmail compose areas
+ * GitHub Copilot-style AI autocomplete for Gmail
+ * 
+ * Architecture:
+ * - GmailObserver: Detects compose areas using MutationObserver
+ * - InputManager: Handles typing events and debouncing
+ * - SuggestionEngine: Manages AI API calls and retry logic
+ * - GhostRenderer: Renders and manages ghost text
+ * - KeyboardHandler: Manages Tab/Esc interactions
+ * - EmailCopilot: Main orchestrator class
  */
 
-// Mark as injected to prevent double injection
-window.emailCopilotInjected = true;
+// Prevent multiple injections
+if (window.emailCopilotInjected) {
+  console.log('📧 Email Copilot: Already injected, skipping');
+} else {
+  window.emailCopilotInjected = true;
+  console.log('📧 Email Copilot: Injecting content script');
 
-// Add status indicator to Gmail
-function createStatusIndicator() {
-  const indicator = document.createElement('div');
-  indicator.id = 'email-copilot-status';
-  indicator.innerHTML = `
-    <div style="
-      position: fixed;
-      top: 10px;
-      right: 10px;
-      background: #4285f4;
-      color: white;
-      padding: 8px 12px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 500;
-      z-index: 10000;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-      font-family: 'Google Sans', 'Roboto', sans-serif;
-    ">
-      ✨ Email Copilot Active
-    </div>
-  `;
-  document.body.appendChild(indicator);
-  
-  // Remove after 3 seconds
-  setTimeout(() => {
-    if (indicator.parentNode) {
-      indicator.remove();
-    }
-  }, 3000);
-}
+  // =============================================================================
+  // UTILITY FUNCTIONS
+  // =============================================================================
 
-// Add Copilot button to Gmail compose toolbar
-function addCopilotButton(composeElement) {
-  // Find the compose toolbar (formatting buttons area)
-  const toolbar = composeElement.closest('.M9').querySelector('.aoD.hl, .btC, .IZ');
-  if (!toolbar || toolbar.querySelector('.email-copilot-button')) return;
-
-  const copilotButton = document.createElement('div');
-  copilotButton.className = 'email-copilot-button';
-  copilotButton.innerHTML = `
-    <div style="
-      display: inline-flex;
-      align-items: center;
-      padding: 6px 12px;
-      margin: 0 4px;
-      background: #f8f9fa;
-      border: 1px solid #dadce0;
-      border-radius: 20px;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 500;
-      color: #5f6368;
-      font-family: 'Google Sans', 'Roboto', sans-serif;
-      transition: all 0.2s ease;
-      user-select: none;
-    " 
-    onmouseover="this.style.background='#e8f0fe'; this.style.borderColor='#4285f4'; this.style.color='#1a73e8';"
-    onmouseout="this.style.background='#f8f9fa'; this.style.borderColor='#dadce0'; this.style.color='#5f6368';"
-    onclick="this.dispatchEvent(new CustomEvent('copilot-trigger'));"
-    title="Trigger AI suggestion (Ctrl+Space)">
-      ✨ AI Copilot
-    </div>
-  `;
-
-  // Add click handler
-  copilotButton.addEventListener('copilot-trigger', () => {
-    if (window.emailCopilotContent && window.emailCopilotContent.activeComposeElement === composeElement) {
-      window.emailCopilotContent.getSuggestion(true);
-    }
-  });
-
-  toolbar.appendChild(copilotButton);
-  return copilotButton;
-}
-
-// Add status indicator to compose area
-function addComposeStatusIndicator(composeElement) {
-  const existingIndicator = composeElement.parentElement.querySelector('.email-copilot-status-bar');
-  if (existingIndicator) return existingIndicator;
-
-  const statusBar = document.createElement('div');
-  statusBar.className = 'email-copilot-status-bar';
-  statusBar.innerHTML = `
-    <div style="
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 4px 8px;
-      margin: 4px 0;
-      background: linear-gradient(90deg, #e8f0fe 0%, #f8f9fa 100%);
-      border: 1px solid #e1e3e1;
-      border-radius: 6px;
-      font-size: 11px;
-      font-weight: 500;
-      color: #5f6368;
-      font-family: 'Google Sans', 'Roboto', sans-serif;
-    ">
-      <span class="status-text">✨ AI Copilot Ready</span>
-      <span class="status-shortcut">Ctrl+Space to trigger</span>
-    </div>
-  `;
-
-  // Insert before the compose element
-  composeElement.parentElement.insertBefore(statusBar, composeElement);
-  return statusBar;
-}
-
-// Update status indicator
-function updateStatusIndicator(element, status, message) {
-  const statusBar = element?.closest('.M9')?.querySelector('.email-copilot-status-bar');
-  if (!statusBar) return;
-
-  const statusText = statusBar.querySelector('.status-text');
-  const statusShortcut = statusBar.querySelector('.status-shortcut');
-  
-  if (statusText && statusShortcut) {
-    switch (status) {
-      case 'ready':
-        statusText.textContent = '✨ AI Copilot Ready';
-        statusShortcut.textContent = 'Ctrl+Space to trigger';
-        statusBar.style.background = 'linear-gradient(90deg, #e8f0fe 0%, #f8f9fa 100%)';
-        break;
-      case 'thinking':
-        statusText.textContent = '🤖 Generating suggestion...';
-        statusShortcut.textContent = 'Please wait';
-        statusBar.style.background = 'linear-gradient(90deg, #fef7e0 0%, #f8f9fa 100%)';
-        break;
-      case 'suggestion':
-        statusText.textContent = '💡 Suggestion ready';
-        statusShortcut.textContent = 'Tab to accept, Esc to dismiss';
-        statusBar.style.background = 'linear-gradient(90deg, #e6f4ea 0%, #f8f9fa 100%)';
-        break;
-      case 'error':
-        statusText.textContent = '⚠️ ' + (message || 'Error occurred');
-        statusShortcut.textContent = 'Try Ctrl+Space';
-        statusBar.style.background = 'linear-gradient(90deg, #fce8e6 0%, #f8f9fa 100%)';
-        break;
-    }
-  }
-}
-
-// Gmail Observer class
-class GmailObserver {
-  constructor() {
-    this.observer = null;
-    this.observedElements = new Set();
-    this.onComposeDetected = null;
-    this.onComposeRemoved = null;
-    this.isObserving = false;
+  /**
+   * Debounce utility function
+   */
+  function debounce(func, wait, immediate = false) {
+    let timeout;
+    return function executedFunction(...args) {
+      const later = () => {
+        timeout = null;
+        if (!immediate) func(...args);
+      };
+      const callNow = immediate && !timeout;
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+      if (callNow) func(...args);
+    };
   }
 
-  startObserving() {
-    if (this.isObserving) return;
-
-    this.observer = new MutationObserver((mutations) => {
-      this.handleMutations(mutations);
-    });
-
-    this.observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['contenteditable', 'role', 'aria-label', 'class']
-    });
-
-    this.isObserving = true;
-    console.log('📧 Gmail Observer: Started observing');
-  }
-
-  handleMutations(mutations) {
-    for (const mutation of mutations) {
-      if (mutation.type === 'childList') {
-        mutation.addedNodes.forEach(node => {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            this.checkForComposeElements(node);
-          }
-        });
-      } else if (mutation.type === 'attributes') {
-        this.checkForComposeElements(mutation.target);
+  /**
+   * Throttle utility function
+   */
+  function throttle(func, limit) {
+    let inThrottle;
+    return function(...args) {
+      if (!inThrottle) {
+        func.apply(this, args);
+        inThrottle = true;
+        setTimeout(() => inThrottle = false, limit);
       }
-    }
+    };
   }
 
-  checkForComposeElements(element) {
-    if (this.isComposeElement(element)) {
-      this.handleComposeDetected(element);
-    }
-
-    // More comprehensive selectors for different Gmail layouts
-    const composeSelectors = [
-      'div[role="textbox"][aria-label*="message body"]',
-      'div[role="textbox"][aria-label*="Message Body"]', 
-      'div[role="textbox"][aria-label*="Message body"]',
-      'div[contenteditable="true"][aria-label*="Message"]',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"][g_editable="true"]',
-      '.Am.Al.editable',
-      '.editable[contenteditable="true"]',
-      '[contenteditable="true"].Am',
-      'div[contenteditable="true"]:not(.gmail_signature):not(.gmail_quote)'
-    ];
-
-    composeSelectors.forEach(selector => {
-      try {
-        const elements = element.querySelectorAll ? element.querySelectorAll(selector) : [];
-        elements.forEach(composeElement => {
-          if (this.isComposeElement(composeElement)) {
-            this.handleComposeDetected(composeElement);
-          }
-        });
-      } catch (error) {
-        // Ignore selector errors
-      }
-    });
-  }
-
-  isComposeElement(element) {
-    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
-    if (!element.isContentEditable) return false;
+  /**
+   * Text sanitization utility
+   */
+  function sanitizeText(text) {
+    if (!text || typeof text !== 'string') return '';
     
-    // Check if already attached
-    if (element.dataset.emailCopilotAttached) return false;
+    return text
+      .trim()
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/\s{2,}/g, ' ')
+      .slice(0, 500); // Limit suggestion length
+  }
+
+  /**
+   * Check if user is in middle of selection or editing
+   */
+  function isUserEditing() {
+    const selection = window.getSelection();
+    if (selection.rangeCount === 0) return false;
     
-    // Check aria-label
-    const ariaLabel = element.getAttribute('aria-label') || '';
-    if (ariaLabel.toLowerCase().includes('message body') || 
-        ariaLabel.toLowerCase().includes('message') ||
-        ariaLabel.toLowerCase().includes('compose')) {
-      return true;
+    const range = selection.getRangeAt(0);
+    return !range.collapsed; // User has text selected
+  }
+
+  /**
+   * Get cursor position relative to element
+   */
+  function getCursorPosition(element) {
+    const selection = window.getSelection();
+    if (selection.rangeCount === 0) return null;
+    
+    const range = selection.getRangeAt(0);
+    const textBeforeCursor = range.cloneRange();
+    textBeforeCursor.selectNodeContents(element);
+    textBeforeCursor.setEnd(range.startContainer, range.startOffset);
+    
+    return {
+      offset: textBeforeCursor.toString().length,
+      range: range,
+      atEnd: range.startOffset === range.startContainer.textContent?.length
+    };
+  }
+
+  // =============================================================================
+  // GMAIL OBSERVER MODULE
+  // =============================================================================
+
+  class GmailObserver {
+    constructor() {
+      this.observer = null;
+      this.composeElements = new Set();
+      this.callbacks = {
+        onComposeAdded: [],
+        onComposeRemoved: []
+      };
+      this.isObserving = false;
     }
 
-    // Check role
-    if (element.getAttribute('role') === 'textbox') {
-      const parentText = element.parentElement?.textContent || '';
-      if (parentText.toLowerCase().includes('compose') || 
-          parentText.toLowerCase().includes('message')) {
-        return true;
+    start() {
+      if (this.isObserving) return;
+
+      this.observer = new MutationObserver(this.handleMutations.bind(this));
+      this.observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['contenteditable', 'role', 'aria-label', 'class']
+      });
+
+      this.isObserving = true;
+      console.log('📧 GmailObserver: Started monitoring DOM');
+      
+      // Check for existing compose areas
+      this.scanForExistingComposeAreas();
+    }
+
+    stop() {
+      if (this.observer) {
+        this.observer.disconnect();
+        this.observer = null;
       }
+      this.isObserving = false;
+      console.log('📧 GmailObserver: Stopped monitoring');
     }
 
-    // Check Gmail-specific classes
-    const gmailClasses = ['Am', 'Al', 'editable'];
-    if (gmailClasses.some(cls => element.classList.contains(cls))) {
-      return true;
+    onComposeAdded(callback) {
+      this.callbacks.onComposeAdded.push(callback);
     }
 
-    // Check if it's in a compose container
-    const composeContainer = element.closest('.nH, .M9, .aDM, .n1tfz, .aO7, .nH .ar');
-    if (composeContainer && element.isContentEditable) {
-      // Make sure it's not signature or quote
-      if (!element.closest('.gmail_signature, .gmail_quote, .ii, .adP, .adO')) {
-        const rect = element.getBoundingClientRect();
-        if (rect.width > 100 && rect.height > 50) {
-          return true;
+    onComposeRemoved(callback) {
+      this.callbacks.onComposeRemoved.push(callback);
+    }
+
+    handleMutations(mutations) {
+      for (const mutation of mutations) {
+        if (mutation.type === 'childList') {
+          // Check added nodes
+          mutation.addedNodes.forEach(node => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              this.scanForComposeElements(node);
+            }
+          });
+
+          // Check removed nodes
+          mutation.removedNodes.forEach(node => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              this.handleRemovedNode(node);
+            }
+          });
+        } else if (mutation.type === 'attributes') {
+          this.checkSingleElement(mutation.target);
         }
       }
     }
 
-    return false;
-  }
+    scanForExistingComposeAreas() {
+      console.log('📧 GmailObserver: Scanning for existing compose areas');
+      this.scanForComposeElements(document.body);
+    }
 
-  handleComposeDetected(element) {
-    if (this.observedElements.has(element)) return;
-    
-    console.log('🎯 Gmail Observer: Compose element detected', element);
-    this.observedElements.add(element);
+    scanForComposeElements(rootElement) {
+      const composeSelectors = [
+        // Gmail compose message body selectors (comprehensive)
+        'div[role="textbox"][aria-label*="message body" i]',
+        'div[role="textbox"][aria-label*="Message Body" i]',
+        'div[contenteditable="true"][aria-label*="message" i]',
+        'div[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"][g_editable="true"]',
+        '.Am.Al.editable',
+        '.editable[contenteditable="true"]',
+        '[contenteditable="true"].Am',
+        'div[contenteditable="true"]:not([aria-label*="subject" i]):not([aria-label*="to" i]):not([aria-label*="cc" i]):not([aria-label*="bcc" i])'
+      ];
 
-    // Add UI integrations
-    setTimeout(() => {
-      addCopilotButton(element);
-      addComposeStatusIndicator(element);
-    }, 500);
+      composeSelectors.forEach(selector => {
+        try {
+          const elements = rootElement.querySelectorAll ? 
+            rootElement.querySelectorAll(selector) : 
+            (rootElement.matches && rootElement.matches(selector) ? [rootElement] : []);
+          
+          elements.forEach(element => this.checkSingleElement(element));
+        } catch (error) {
+          // Ignore invalid selectors
+        }
+      });
+    }
 
-    if (this.onComposeDetected) {
-      try {
-        this.onComposeDetected(element);
-      } catch (error) {
-        console.error('Error in compose detected callback:', error);
+    checkSingleElement(element) {
+      if (this.isValidComposeElement(element)) {
+        if (!this.composeElements.has(element)) {
+          this.addComposeElement(element);
+        }
+      } else if (this.composeElements.has(element)) {
+        this.removeComposeElement(element);
       }
     }
-  }
-}
 
-// Ghost Text Renderer class
-class GhostTextRenderer {
-  constructor() {
-    this.ghostElement = null;
-    this.targetElement = null;
-    this.isVisible = false;
-  }
+    isValidComposeElement(element) {
+      if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+      if (!element.isContentEditable) return false;
+      if (element.hasAttribute('data-copilot-attached')) return false;
 
-  show(targetElement, suggestion) {
-    if (!targetElement || !suggestion) return;
+      // Check if it's in a Gmail compose container
+      const composeContainer = element.closest('.nH, .M9, .aDM, .n1tfz, .aO7');
+      if (!composeContainer) return false;
 
-    console.log('👻 Showing ghost text:', suggestion);
-    
-    this.targetElement = targetElement;
-    this.hide();
-    
-    this.createGhostElement(suggestion);
-    this.positionGhostElement();
-    
-    this.isVisible = true;
-    
-    // Update status indicator
-    updateStatusIndicator(targetElement, 'suggestion');
-  }
+      // Exclude signature, quote, and other non-message areas
+      const exclusionSelectors = [
+        '.gmail_signature', '.gmail_quote', '.ii', '.adP', '.adO',
+        '[aria-label*="subject" i]', '[aria-label*="to" i]', 
+        '[aria-label*="cc" i]', '[aria-label*="bcc" i]'
+      ];
 
-  hide() {
-    if (this.ghostElement) {
-      this.ghostElement.remove();
-      this.ghostElement = null;
+      for (const selector of exclusionSelectors) {
+        if (element.matches(selector) || element.closest(selector)) {
+          return false;
+        }
+      }
+
+      // Check element dimensions (must be reasonably sized)
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 100 || rect.height < 30) return false;
+
+      // Additional validation for message body
+      const ariaLabel = element.getAttribute('aria-label') || '';
+      const hasMessageBodyLabel = /message.?body/i.test(ariaLabel);
+      const isTextboxRole = element.getAttribute('role') === 'textbox';
+      const hasGmailClasses = element.classList.contains('Am') || 
+                              element.classList.contains('editable');
+
+      return hasMessageBodyLabel || (isTextboxRole && composeContainer) || hasGmailClasses;
     }
-    
-    this.isVisible = false;
-    
-    // Update status indicator
-    if (this.targetElement) {
-      updateStatusIndicator(this.targetElement, 'ready');
+
+    addComposeElement(element) {
+      console.log('📧 GmailObserver: New compose element detected', element);
+      this.composeElements.add(element);
+      element.setAttribute('data-copilot-attached', 'true');
+
+      this.callbacks.onComposeAdded.forEach(callback => {
+        try {
+          callback(element);
+        } catch (error) {
+          console.error('📧 Error in compose added callback:', error);
+        }
+      });
     }
-    
-    this.targetElement = null;
+
+    removeComposeElement(element) {
+      console.log('📧 GmailObserver: Compose element removed', element);
+      this.composeElements.delete(element);
+      element.removeAttribute('data-copilot-attached');
+
+      this.callbacks.onComposeRemoved.forEach(callback => {
+        try {
+          callback(element);
+        } catch (error) {
+          console.error('📧 Error in compose removed callback:', error);
+        }
+      });
+    }
+
+    handleRemovedNode(node) {
+      // Check if any tracked compose elements were removed
+      const removedElements = Array.from(this.composeElements).filter(element => 
+        !document.contains(element) || node.contains(element)
+      );
+
+      removedElements.forEach(element => this.removeComposeElement(element));
+    }
   }
 
-  createGhostElement(suggestion) {
-    this.ghostElement = document.createElement('span');
-    this.ghostElement.className = 'email-copilot-ghost-text';
-    this.ghostElement.textContent = suggestion;
-    
-    // Enhanced styling
-    this.ghostElement.style.cssText = `
-      color: #9ca3af !important;
-      background: rgba(66, 133, 244, 0.08) !important;
-      font-style: italic !important;
-      opacity: 0.8 !important;
-      pointer-events: none !important;
-      user-select: none !important;
-      border-radius: 3px !important;
-      padding: 1px 3px !important;
-      margin: 0 1px !important;
-      border: 1px solid rgba(66, 133, 244, 0.2) !important;
-    `;
+  // =============================================================================
+  // INPUT MANAGER MODULE
+  // =============================================================================
+
+  class InputManager {
+    constructor(debounceMs = 300) {
+      this.debounceMs = debounceMs;
+      this.callbacks = {
+        onInput: [],
+        onBackspace: [],
+        onDelete: []
+      };
+      this.lastInputTime = 0;
+      this.isBackspacing = false;
+      this.lastTextLength = 0;
+    }
+
+    attachToElement(element) {
+      if (element.hasAttribute('data-input-attached')) return;
+      
+      element.setAttribute('data-input-attached', 'true');
+      
+      // Debounced input handler
+      const debouncedInputHandler = debounce(
+        this.handleInput.bind(this), 
+        this.debounceMs
+      );
+
+      // Input event listener
+      element.addEventListener('input', (event) => {
+        this.lastInputTime = Date.now();
+        const currentLength = element.textContent?.length || 0;
+        
+        // Detect backspacing/deleting
+        this.isBackspacing = currentLength < this.lastTextLength;
+        this.lastTextLength = currentLength;
+
+        if (this.isBackspacing) {
+          this.callbacks.onBackspace.forEach(cb => cb(element, event));
+        } else {
+          debouncedInputHandler(element, event);
+        }
+      });
+
+      // Keydown event for immediate backspace/delete detection
+      element.addEventListener('keydown', (event) => {
+        if (event.key === 'Backspace') {
+          this.isBackspacing = true;
+          this.callbacks.onBackspace.forEach(cb => cb(element, event));
+        } else if (event.key === 'Delete') {
+          this.callbacks.onDelete.forEach(cb => cb(element, event));
+        }
+      });
+
+      console.log('📧 InputManager: Attached to element');
+    }
+
+    detachFromElement(element) {
+      element.removeAttribute('data-input-attached');
+      // Note: Event listeners will be garbage collected when element is removed
+    }
+
+    handleInput(element, event) {
+      // Don't trigger suggestions if user is selecting text or backspacing
+      if (isUserEditing() || this.isBackspacing) {
+        console.log('📧 InputManager: Skipping - user is editing or backspacing');
+        return;
+      }
+
+      const text = this.extractText(element);
+      if (!this.shouldTriggerSuggestion(text)) {
+        console.log('📧 InputManager: Skipping - text not suitable for suggestion');
+        return;
+      }
+
+      console.log('📧 InputManager: Triggering suggestion for text:', text.slice(-50));
+      this.callbacks.onInput.forEach(callback => {
+        try {
+          callback(element, text, event);
+        } catch (error) {
+          console.error('📧 Error in input callback:', error);
+        }
+      });
+    }
+
+    extractText(element) {
+      // Get text content, preserving some structure
+      const text = element.textContent || element.innerText || '';
+      return text.replace(/\s+/g, ' ').trim();
+    }
+
+    shouldTriggerSuggestion(text) {
+      // Minimum text length
+      if (text.length < 10) return false;
+      
+      // Check if cursor is at a reasonable position for suggestions
+      const words = text.split(/\s+/);
+      if (words.length < 3) return false;
+      
+      // Don't suggest if text ends with punctuation (user might be done)
+      const lastChar = text.slice(-1);
+      if (/[.!?]/.test(lastChar)) return false;
+      
+      return true;
+    }
+
+    onInput(callback) {
+      this.callbacks.onInput.push(callback);
+    }
+
+    onBackspace(callback) {
+      this.callbacks.onBackspace.push(callback);
+    }
+
+    onDelete(callback) {
+      this.callbacks.onDelete.push(callback);
+    }
   }
 
-  positionGhostElement() {
-    if (!this.ghostElement || !this.targetElement) return;
+  // =============================================================================
+  // SUGGESTION ENGINE MODULE
+  // =============================================================================
 
-    // For contenteditable divs, insert at cursor position
-    const selection = window.getSelection();
-    if (selection.rangeCount > 0) {
+  class SuggestionEngine {
+    constructor() {
+      this.pendingRequests = new Map();
+      this.retryAttempts = 3;
+      this.retryDelay = 1000; // Start with 1 second
+      this.cache = new Map();
+      this.cacheSize = 50;
+    }
+
+    async getSuggestion(text, context = '', retryCount = 0) {
+      const cacheKey = this.getCacheKey(text, context);
+      
+      // Check cache first
+      if (this.cache.has(cacheKey)) {
+        console.log('📧 SuggestionEngine: Using cached suggestion');
+        return this.cache.get(cacheKey);
+      }
+
+      // Cancel any pending request for the same text
+      if (this.pendingRequests.has(cacheKey)) {
+        console.log('📧 SuggestionEngine: Cancelling previous request');
+        this.pendingRequests.get(cacheKey).abort();
+      }
+
+      try {
+        const result = await this.makeApiRequest(text, context, cacheKey);
+        
+        // Cache successful results
+        if (result.success && result.suggestion) {
+          this.addToCache(cacheKey, result);
+        }
+        
+        return result;
+      } catch (error) {
+        console.error('📧 SuggestionEngine: API request failed:', error);
+        
+        // Retry logic
+        if (retryCount < this.retryAttempts) {
+          const delay = this.retryDelay * Math.pow(2, retryCount); // Exponential backoff
+          console.log(`📧 SuggestionEngine: Retrying in ${delay}ms (attempt ${retryCount + 1})`);
+          
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.getSuggestion(text, context, retryCount + 1);
+        }
+        
+        return {
+          success: false,
+          error: error.message || 'Failed to get suggestion after retries'
+        };
+      }
+    }
+
+    async makeApiRequest(text, context, cacheKey) {
+      const controller = new AbortController();
+      this.pendingRequests.set(cacheKey, controller);
+
+      try {
+        console.log('📧 SuggestionEngine: Making API request');
+        
+        const response = await chrome.runtime.sendMessage({
+          type: 'get_ai_completion',
+          context: context,
+          partialText: text,
+          prompt: this.buildPrompt(text, context)
+        });
+
+        this.pendingRequests.delete(cacheKey);
+
+        if (response && response.success) {
+          const suggestion = sanitizeText(response.suggestion);
+          if (suggestion && suggestion.length > 0) {
+            return { success: true, suggestion };
+          } else {
+            return { success: false, error: 'Empty suggestion received' };
+          }
+        } else {
+          return { 
+            success: false, 
+            error: response?.error || 'API request failed' 
+          };
+        }
+      } catch (error) {
+        this.pendingRequests.delete(cacheKey);
+        throw error;
+      }
+    }
+
+    buildPrompt(text, context) {
+      let prompt = "Complete this professional email naturally and concisely:\n\n";
+      
+      if (context.trim()) {
+        prompt += `Context: ${context}\n\n`;
+      }
+      
+      prompt += `Email text: "${text}"\n\n`;
+      prompt += "Continue the email with 1-2 sentences maximum. ";
+      prompt += "Match the tone and style. Provide only the continuation, not the full email.";
+      
+      return prompt;
+    }
+
+    getCacheKey(text, context) {
+      // Create a simple hash for caching
+      const combined = `${text}|${context}`;
+      return combined.slice(-100); // Use last 100 chars as key
+    }
+
+    addToCache(key, result) {
+      // Simple LRU cache
+      if (this.cache.size >= this.cacheSize) {
+        const firstKey = this.cache.keys().next().value;
+        this.cache.delete(firstKey);
+      }
+      this.cache.set(key, result);
+    }
+
+    cancelPendingRequests() {
+      this.pendingRequests.forEach(controller => controller.abort());
+      this.pendingRequests.clear();
+    }
+  }
+
+  // =============================================================================
+  // GHOST RENDERER MODULE
+  // =============================================================================
+
+  class GhostRenderer {
+    constructor() {
+      this.activeGhost = null;
+      this.targetElement = null;
+      this.isVisible = false;
+    }
+
+    show(element, suggestion) {
+      if (!element || !suggestion) {
+        console.warn('📧 GhostRenderer: Invalid parameters for show()');
+        return false;
+      }
+
+      this.hide(); // Clear any existing ghost text
+      
+      try {
+        this.targetElement = element;
+        this.createGhostElement(suggestion);
+        
+        if (this.insertGhostText()) {
+          this.isVisible = true;
+          console.log('📧 GhostRenderer: Ghost text displayed');
+          return true;
+        } else {
+          this.cleanup();
+          return false;
+        }
+      } catch (error) {
+        console.error('📧 GhostRenderer: Failed to show ghost text:', error);
+        this.cleanup();
+        return false;
+      }
+    }
+
+    hide() {
+      if (this.activeGhost) {
+        try {
+          this.activeGhost.remove();
+        } catch (error) {
+          // Element might already be removed
+        }
+      }
+      this.cleanup();
+    }
+
+    cleanup() {
+      this.activeGhost = null;
+      this.targetElement = null;
+      this.isVisible = false;
+    }
+
+    createGhostElement(suggestion) {
+      this.activeGhost = document.createElement('span');
+      this.activeGhost.className = 'email-copilot-ghost-text';
+      this.activeGhost.textContent = suggestion;
+      this.activeGhost.setAttribute('data-copilot-ghost', 'true');
+      
+      // Enhanced styling for better visibility
+      Object.assign(this.activeGhost.style, {
+        color: '#9ca3af',
+        backgroundColor: 'rgba(66, 133, 244, 0.05)',
+        fontStyle: 'italic',
+        opacity: '0.75',
+        pointerEvents: 'none',
+        userSelect: 'none',
+        borderRadius: '2px',
+        padding: '0 2px',
+        border: '1px solid rgba(66, 133, 244, 0.15)',
+        display: 'inline',
+        whiteSpace: 'pre-wrap'
+      });
+    }
+
+    insertGhostText() {
+      const selection = window.getSelection();
+      if (selection.rangeCount === 0) {
+        console.warn('📧 GhostRenderer: No selection range available');
+        return false;
+      }
+
       try {
         const range = selection.getRangeAt(0);
         const clonedRange = range.cloneRange();
-        clonedRange.collapse(false);
-        clonedRange.insertNode(this.ghostElement);
         
-        // Move cursor after ghost text
-        clonedRange.setStartAfter(this.ghostElement);
+        // Position at the end of current selection
+        clonedRange.collapse(false);
+        clonedRange.insertNode(this.activeGhost);
+        
+        // Move cursor after ghost text to maintain position
+        clonedRange.setStartAfter(this.activeGhost);
         clonedRange.collapse(true);
         selection.removeAllRanges();
         selection.addRange(clonedRange);
         
+        return true;
       } catch (error) {
-        console.error('Failed to position ghost text:', error);
-        // Fallback: append to end
-        this.targetElement.appendChild(this.ghostElement);
-      }
-    } else {
-      // Fallback: append to end
-      this.targetElement.appendChild(this.ghostElement);
-    }
-  }
-}
-
-// Keyboard Manager class
-class EmailCopilotKeybinds {
-  constructor() {
-    this.suggestionVisible = false;
-    this.onAcceptSuggestion = null;
-    this.onRejectSuggestion = null;
-    this.onTriggerSuggestion = null;
-  }
-
-  handleKeyEvent(event) {
-    const key = event.key.toLowerCase();
-    
-    if (key === 'tab' && this.suggestionVisible && this.onAcceptSuggestion) {
-      event.preventDefault();
-      event.stopPropagation();
-      console.log('⌨️ Tab pressed - accepting suggestion');
-      this.onAcceptSuggestion(event);
-    } else if (key === 'escape' && this.suggestionVisible && this.onRejectSuggestion) {
-      event.preventDefault();
-      event.stopPropagation();
-      console.log('⌨️ Escape pressed - rejecting suggestion');
-      this.onRejectSuggestion(event);
-    } else if (event.ctrlKey && key === ' ' && this.onTriggerSuggestion) {
-      event.preventDefault();
-      event.stopPropagation();
-      console.log('⌨️ Ctrl+Space pressed - manual trigger');
-      this.onTriggerSuggestion(event);
-    } else if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key) && 
-               this.suggestionVisible && this.onRejectSuggestion) {
-      console.log('⌨️ Arrow key pressed - dismissing suggestion');
-      this.onRejectSuggestion(event);
-    }
-  }
-
-  setSuggestionVisible(visible) {
-    this.suggestionVisible = visible;
-    console.log('🎯 Suggestion visibility changed:', visible);
-  }
-
-  setAcceptCallback(callback) {
-    this.onAcceptSuggestion = callback;
-  }
-
-  setRejectCallback(callback) {
-    this.onRejectSuggestion = callback;
-  }
-
-  setTriggerCallback(callback) {
-    this.onTriggerSuggestion = callback;
-  }
-}
-
-// Main Email Copilot Content class
-class EmailCopilotContent {
-  constructor() {
-    this.isEnabled = true;
-    this.ghostRenderer = new GhostTextRenderer();
-    this.gmailObserver = new GmailObserver();
-    this.activeComposeElement = null;
-    this.currentSuggestion = null;
-    this.suggestionTimeout = null;
-    this.keybindManager = new EmailCopilotKeybinds();
-    
-    // Debounced function for getting suggestions
-    this.debouncedGetSuggestion = this.debounce(this.getSuggestion.bind(this), 800);
-    
-    this.initialize();
-  }
-
-  /**
-   * Debounce function to limit API calls
-   */
-  debounce(func, wait) {
-    let timeout;
-    return function executedFunction(...args) {
-      const later = () => {
-        clearTimeout(timeout);
-        func(...args);
-      };
-      clearTimeout(timeout);
-      timeout = setTimeout(later, wait);
-    };
-  }
-
-  /**
-   * Initialize the content script
-   */
-  async initialize() {
-    console.log('🚀 Email Copilot: Initializing...');
-    
-    try {
-      // Show status indicator
-      createStatusIndicator();
-      
-      // Setup keyboard handlers
-      this.setupKeyboardHandlers();
-      
-      // Setup Gmail observer
-      this.setupGmailObserver();
-      
-      // Inject styles
-      this.injectStyles();
-      
-      // Start observing for compose areas
-      this.startObserving();
-      
-      console.log('✅ Email Copilot: Successfully initialized');
-    } catch (error) {
-      console.error('❌ Email Copilot: Failed to initialize:', error);
-    }
-  }
-
-  setupKeyboardHandlers() {
-    this.keybindManager.setAcceptCallback(() => {
-      this.acceptSuggestion();
-    });
-
-    this.keybindManager.setRejectCallback(() => {
-      this.rejectSuggestion();
-    });
-
-    this.keybindManager.setTriggerCallback((event) => {
-      if (this.activeComposeElement) {
-        console.log('🎯 Manual trigger activated');
-        this.getSuggestion(true);
-      }
-    });
-
-    document.addEventListener('keydown', (event) => {
-      this.keybindManager.handleKeyEvent(event);
-    });
-  }
-
-  setupGmailObserver() {
-    this.gmailObserver.onComposeDetected = (composeElement) => {
-      this.attachToComposeElement(composeElement);
-    };
-
-    this.gmailObserver.onComposeRemoved = (composeElement) => {
-      this.detachFromComposeElement(composeElement);
-    };
-  }
-
-  injectStyles() {
-    const style = document.createElement('style');
-    style.textContent = `
-      .email-copilot-ghost-text {
-        color: #9ca3af !important;
-        background: rgba(66, 133, 244, 0.08) !important;
-        font-style: italic !important;
-        opacity: 0.8 !important;
-        pointer-events: none !important;
-        user-select: none !important;
-        border-radius: 3px !important;
-        padding: 1px 3px !important;
-        margin: 0 1px !important;
-        border: 1px solid rgba(66, 133, 244, 0.2) !important;
-        transition: all 0.2s ease !important;
-      }
-
-      .email-copilot-compose-wrapper {
-        position: relative !important;
-      }
-
-      .email-copilot-button:hover {
-        transform: translateY(-1px) !important;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
-      }
-
-      .email-copilot-status-bar {
-        transition: all 0.3s ease !important;
-      }
-
-      @keyframes emailCopilotPulse {
-        0%, 100% { opacity: 0.8; }
-        50% { opacity: 1; }
-      }
-
-      .email-copilot-thinking .status-text {
-        animation: emailCopilotPulse 1.5s infinite !important;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  startObserving() {
-    // Wait for Gmail to fully load
-    setTimeout(() => {
-      this.findExistingComposeAreas();
-      this.gmailObserver.startObserving();
-    }, 1000);
-  }
-
-  findExistingComposeAreas() {
-    const composeSelectors = [
-      'div[role="textbox"][aria-label*="message body"]',
-      'div[role="textbox"][aria-label*="Message Body"]',
-      'div[role="textbox"][aria-label*="Message body"]',
-      'div[contenteditable="true"][aria-label*="Message"]',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"][g_editable="true"]',
-      '.Am.Al.editable',
-      '.editable[contenteditable="true"]',
-      '[contenteditable="true"].Am'
-    ];
-
-    console.log('🔍 Searching for existing compose areas...');
-    
-    composeSelectors.forEach(selector => {
-      const elements = document.querySelectorAll(selector);
-      console.log(`Found ${elements.length} elements for selector: ${selector}`);
-      elements.forEach(element => {
-        if (this.isValidComposeElement(element)) {
-          console.log('✅ Valid compose element found:', element);
-          this.attachToComposeElement(element);
+        console.error('📧 GhostRenderer: Failed to insert ghost text:', error);
+        
+        // Fallback: append to end of element
+        try {
+          this.targetElement.appendChild(this.activeGhost);
+          return true;
+        } catch (fallbackError) {
+          console.error('📧 GhostRenderer: Fallback insertion also failed:', fallbackError);
+          return false;
         }
-      });
-    });
-  }
-
-  isValidComposeElement(element) {
-    if (!element || !element.isContentEditable) return false;
-    
-    const composeContainer = element.closest('.nH, .M9, .aDM, .n1tfz, .aO7');
-    if (!composeContainer) return false;
-
-    if (element.closest('.gmail_signature, .gmail_quote, .ii, .adP, .adO')) return false;
-
-    const rect = element.getBoundingClientRect();
-    if (rect.width < 100 || rect.height < 50) return false;
-
-    return true;
-  }
-
-  attachToComposeElement(element) {
-    if (element.dataset.emailCopilotAttached) return;
-    
-    console.log('🔗 Attaching to compose element:', element);
-    
-    element.dataset.emailCopilotAttached = 'true';
-    element.classList.add('email-copilot-compose-wrapper');
-    
-    element.addEventListener('input', this.handleInput.bind(this));
-    element.addEventListener('keydown', this.handleKeyDown.bind(this));
-    element.addEventListener('focus', this.handleFocus.bind(this));
-    element.addEventListener('blur', this.handleBlur.bind(this));
-    element.addEventListener('click', this.handleClick.bind(this));
-    
-    // Add UI elements
-    setTimeout(() => {
-      addCopilotButton(element);
-      const statusBar = addComposeStatusIndicator(element);
-      updateStatusIndicator(element, 'ready');
-    }, 100);
-  }
-
-  detachFromComposeElement(element) {
-    if (!element.dataset.emailCopilotAttached) return;
-    
-    console.log('🔓 Detaching from compose element:', element);
-    
-    this.ghostRenderer.hide();
-    
-    delete element.dataset.emailCopilotAttached;
-    element.classList.remove('email-copilot-compose-wrapper');
-    
-    if (this.activeComposeElement === element) {
-      this.activeComposeElement = null;
-    }
-  }
-
-  handleInput(event) {
-    const element = event.target;
-    
-    if (!this.isEnabled || !this.isValidComposeElement(element)) return;
-    
-    console.log('⌨️ Input detected in compose area');
-    this.activeComposeElement = element;
-    
-    // Hide current suggestion
-    this.hideSuggestion();
-    
-    // Update status
-    updateStatusIndicator(element, 'thinking');
-    
-    // Get new suggestion after a delay
-    this.debouncedGetSuggestion();
-  }
-
-  handleKeyDown(event) {
-    const element = event.target;
-    
-    if (!this.isEnabled || !this.isValidComposeElement(element)) return;
-    
-    this.activeComposeElement = element;
-    
-    if (['Enter', 'Backspace', 'Delete'].includes(event.key)) {
-      this.hideSuggestion();
-    }
-  }
-
-  handleFocus(event) {
-    const element = event.target;
-    
-    if (!this.isValidComposeElement(element)) return;
-    
-    console.log('🎯 Focus on compose element');
-    this.activeComposeElement = element;
-    updateStatusIndicator(element, 'ready');
-  }
-
-  handleBlur(event) {
-    setTimeout(() => {
-      if (document.activeElement !== event.target) {
-        this.hideSuggestion();
       }
-    }, 100);
+    }
+
+    acceptSuggestion() {
+      if (!this.isVisible || !this.activeGhost) {
+        console.warn('📧 GhostRenderer: No ghost text to accept');
+        return false;
+      }
+
+      try {
+        const suggestionText = this.activeGhost.textContent;
+        
+        // Replace ghost element with actual text
+        const textNode = document.createTextNode(suggestionText);
+        this.activeGhost.parentNode.replaceChild(textNode, this.activeGhost);
+        
+        // Position cursor after inserted text
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.setStartAfter(textNode);
+        range.setEndAfter(textNode);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        
+        // Trigger input event to notify Gmail
+        this.targetElement.dispatchEvent(new Event('input', { bubbles: true }));
+        
+        this.cleanup();
+        console.log('📧 GhostRenderer: Suggestion accepted');
+        return true;
+      } catch (error) {
+        console.error('📧 GhostRenderer: Failed to accept suggestion:', error);
+        this.hide();
+        return false;
+      }
+    }
+
+    getSuggestionText() {
+      return this.activeGhost ? this.activeGhost.textContent : '';
+    }
   }
 
-  handleClick(event) {
-    const element = event.target;
-    
-    if (!this.isValidComposeElement(element)) return;
-    
-    this.activeComposeElement = element;
-    this.hideSuggestion();
+  // =============================================================================
+  // KEYBOARD HANDLER MODULE
+  // =============================================================================
+
+  class KeyboardHandler {
+    constructor() {
+      this.callbacks = {
+        onAccept: [],
+        onReject: [],
+        onManualTrigger: []
+      };
+      this.isListening = false;
+    }
+
+    startListening() {
+      if (this.isListening) return;
+      
+      document.addEventListener('keydown', this.handleKeyDown.bind(this), true);
+      this.isListening = true;
+      console.log('📧 KeyboardHandler: Started listening for keyboard events');
+    }
+
+    stopListening() {
+      if (!this.isListening) return;
+      
+      document.removeEventListener('keydown', this.handleKeyDown.bind(this), true);
+      this.isListening = false;
+      console.log('📧 KeyboardHandler: Stopped listening for keyboard events');
+    }
+
+    handleKeyDown(event) {
+      // Only handle events in Gmail compose areas
+      const target = event.target;
+      if (!target.hasAttribute('data-copilot-attached')) return;
+
+      const key = event.key;
+      
+      // Tab to accept suggestion
+      if (key === 'Tab' && this.hasActiveGhost()) {
+        event.preventDefault();
+        event.stopPropagation();
+        console.log('📧 KeyboardHandler: Tab pressed - accepting suggestion');
+        this.callbacks.onAccept.forEach(cb => cb(target));
+        return;
+      }
+      
+      // Escape to reject suggestion
+      if (key === 'Escape' && this.hasActiveGhost()) {
+        event.preventDefault();
+        event.stopPropagation();
+        console.log('📧 KeyboardHandler: Escape pressed - rejecting suggestion');
+        this.callbacks.onReject.forEach(cb => cb(target));
+        return;
+      }
+      
+      // Ctrl+Space for manual trigger
+      if (event.ctrlKey && key === ' ') {
+        event.preventDefault();
+        event.stopPropagation();
+        console.log('📧 KeyboardHandler: Ctrl+Space pressed - manual trigger');
+        this.callbacks.onManualTrigger.forEach(cb => cb(target));
+        return;
+      }
+      
+      // Arrow keys to dismiss suggestion
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(key) && 
+          this.hasActiveGhost()) {
+        console.log('📧 KeyboardHandler: Arrow key pressed - dismissing suggestion');
+        this.callbacks.onReject.forEach(cb => cb(target));
+        return;
+      }
+    }
+
+    hasActiveGhost() {
+      return document.querySelector('.email-copilot-ghost-text[data-copilot-ghost="true"]') !== null;
+    }
+
+    onAccept(callback) {
+      this.callbacks.onAccept.push(callback);
+    }
+
+    onReject(callback) {
+      this.callbacks.onReject.push(callback);
+    }
+
+    onManualTrigger(callback) {
+      this.callbacks.onManualTrigger.push(callback);
+    }
   }
 
-  async getSuggestion(force = false) {
-    if (!this.activeComposeElement || !this.isEnabled) return;
-    
-    try {
-      const context = this.getEmailContext();
-      const partialText = this.getPartialText();
+  // =============================================================================
+  // MAIN EMAIL COPILOT CLASS
+  // =============================================================================
+
+  class EmailCopilot {
+    constructor() {
+      this.isEnabled = true;
+      this.activeElement = null;
+      this.isProcessing = false;
       
-      console.log('📝 Getting suggestion for text:', partialText);
+      // Initialize modules
+      this.gmailObserver = new GmailObserver();
+      this.inputManager = new InputManager(300); // 300ms debounce
+      this.suggestionEngine = new SuggestionEngine();
+      this.ghostRenderer = new GhostRenderer();
+      this.keyboardHandler = new KeyboardHandler();
       
-      if (!force) {
-        if (!partialText || partialText.trim().length < 5) {
-          console.log('⚠️ Text too short, skipping suggestion');
-          updateStatusIndicator(this.activeComposeElement, 'ready');
+      // Bind methods
+      this.handleComposeAdded = this.handleComposeAdded.bind(this);
+      this.handleComposeRemoved = this.handleComposeRemoved.bind(this);
+      this.handleInput = this.handleInput.bind(this);
+      this.handleBackspace = this.handleBackspace.bind(this);
+      this.handleAccept = this.handleAccept.bind(this);
+      this.handleReject = this.handleReject.bind(this);
+      this.handleManualTrigger = this.handleManualTrigger.bind(this);
+      
+      this.init();
+    }
+
+    async init() {
+      console.log('📧 EmailCopilot: Initializing...');
+      
+      try {
+        // Check if extension is enabled
+        const settings = await this.getSettings();
+        this.isEnabled = settings.enabled !== false;
+        
+        if (!this.isEnabled) {
+          console.log('📧 EmailCopilot: Extension is disabled');
           return;
         }
         
-        if (!this.isCursorAtWordEnd()) {
-          console.log('⚠️ Not at word end, skipping suggestion');
-          updateStatusIndicator(this.activeComposeElement, 'ready');
-          return;
+        // Setup event listeners
+        this.setupEventListeners();
+        
+        // Inject styles
+        this.injectStyles();
+        
+        // Start observing Gmail
+        this.gmailObserver.start();
+        
+        // Start keyboard handler
+        this.keyboardHandler.startListening();
+        
+        console.log('✅ EmailCopilot: Successfully initialized');
+        this.showStatusNotification('Email Copilot Active');
+        
+      } catch (error) {
+        console.error('❌ EmailCopilot: Failed to initialize:', error);
+      }
+    }
+
+    setupEventListeners() {
+      // Gmail Observer events
+      this.gmailObserver.onComposeAdded(this.handleComposeAdded);
+      this.gmailObserver.onComposeRemoved(this.handleComposeRemoved);
+      
+      // Input Manager events
+      this.inputManager.onInput(this.handleInput);
+      this.inputManager.onBackspace(this.handleBackspace);
+      this.inputManager.onDelete(this.handleBackspace);
+      
+      // Keyboard Handler events
+      this.keyboardHandler.onAccept(this.handleAccept);
+      this.keyboardHandler.onReject(this.handleReject);
+      this.keyboardHandler.onManualTrigger(this.handleManualTrigger);
+      
+      // Extension settings changes
+      chrome.runtime.onMessage.addListener((message) => {
+        if (message.type === 'settings_changed') {
+          this.isEnabled = message.enabled;
+          if (!this.isEnabled) {
+            this.clearAllSuggestions();
+          }
         }
-      }
-      
-      console.log('🤖 Requesting AI completion...');
-      updateStatusIndicator(this.activeComposeElement, 'thinking');
-      
-      // Call background script for AI completion
-      const response = await chrome.runtime.sendMessage({
-        type: 'get_ai_completion',
-        context: context,
-        partialText: partialText
       });
-      
-      if (response && response.success && response.suggestion) {
-        console.log('✅ Received suggestion:', response.suggestion);
-        this.showSuggestion(response.suggestion.trim());
-      } else {
-        console.log('❌ No suggestion received:', response);
-        updateStatusIndicator(this.activeComposeElement, 'error', response?.error || 'No suggestion');
-      }
-    } catch (error) {
-      console.error('❌ Failed to get suggestion:', error);
-      updateStatusIndicator(this.activeComposeElement, 'error', 'Connection failed');
     }
-  }
 
-  getEmailContext() {
-    if (!this.activeComposeElement) return '';
-    
-    let context = '';
-    
-    const subjectElement = document.querySelector('input[name="subjectbox"], input[placeholder*="Subject"], input[aria-label*="Subject"]');
-    if (subjectElement && subjectElement.value) {
-      context += `Subject: ${subjectElement.value}\n`;
+    handleComposeAdded(element) {
+      console.log('📧 EmailCopilot: Attaching to new compose element');
+      this.inputManager.attachToElement(element);
+      this.addComposeIndicators(element);
     }
-    
-    const recipientElement = document.querySelector('input[name="to"], textarea[name="to"], div[aria-label*="To"]:not([role="textbox"])');
-    if (recipientElement) {
-      const recipientText = recipientElement.value || recipientElement.textContent || '';
-      if (recipientText.trim()) {
-        context += `To: ${recipientText}\n`;
+
+    handleComposeRemoved(element) {
+      console.log('📧 EmailCopilot: Detaching from removed compose element');
+      this.inputManager.detachFromElement(element);
+      
+      if (this.activeElement === element) {
+        this.clearSuggestion();
+        this.activeElement = null;
       }
     }
-    
-    return context;
-  }
 
-  getPartialText() {
-    if (!this.activeComposeElement) return '';
-    
-    const element = this.activeComposeElement;
-    const text = element.textContent || element.innerText || '';
-    
-    // Get last 150 characters for better context
-    return text.slice(-150);
-  }
-
-  isCursorAtWordEnd() {
-    if (!this.activeComposeElement) return true;
-    
-    const selection = window.getSelection();
-    if (selection.rangeCount === 0) return true;
-    
-    const range = selection.getRangeAt(0);
-    const textNode = range.startContainer;
-    
-    if (textNode.nodeType !== Node.TEXT_NODE) return true;
-    
-    const text = textNode.textContent;
-    const offset = range.startOffset;
-    
-    const charBefore = text.charAt(offset - 1);
-    const charAfter = text.charAt(offset);
-    
-    return /\w/.test(charBefore) && (/\s/.test(charAfter) || charAfter === '' || /[.!?,;:]/.test(charAfter));
-  }
-
-  showSuggestion(suggestion) {
-    if (!this.activeComposeElement || !suggestion) return;
-    
-    this.currentSuggestion = suggestion;
-    this.ghostRenderer.show(this.activeComposeElement, suggestion);
-    this.keybindManager.setSuggestionVisible(true);
-    
-    console.log('👻 Showing suggestion:', suggestion);
-  }
-
-  hideSuggestion() {
-    this.currentSuggestion = null;
-    this.ghostRenderer.hide();
-    this.keybindManager.setSuggestionVisible(false);
-  }
-
-  acceptSuggestion() {
-    if (!this.currentSuggestion || !this.activeComposeElement) return;
-    
-    console.log('✅ Accepting suggestion:', this.currentSuggestion);
-    
-    // Remove ghost text first
-    this.ghostRenderer.hide();
-    
-    // Insert suggestion text
-    this.insertTextAtCursor(this.currentSuggestion);
-    
-    // Clear suggestion
-    this.currentSuggestion = null;
-    this.keybindManager.setSuggestionVisible(false);
-    
-    // Update status
-    updateStatusIndicator(this.activeComposeElement, 'ready');
-    
-    // Track usage
-    this.trackUsage('accept');
-  }
-
-  rejectSuggestion() {
-    if (!this.currentSuggestion) return;
-    
-    console.log('❌ Rejecting suggestion');
-    
-    this.hideSuggestion();
-    updateStatusIndicator(this.activeComposeElement, 'ready');
-    this.trackUsage('reject');
-  }
-
-  insertTextAtCursor(text) {
-    if (!this.activeComposeElement) return;
-    
-    const selection = window.getSelection();
-    if (selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
+    async handleInput(element, text, event) {
+      if (!this.isEnabled || this.isProcessing) return;
       
-      // Delete any ghost text first
-      const ghostText = this.activeComposeElement.querySelector('.email-copilot-ghost-text');
-      if (ghostText) {
-        ghostText.remove();
+      this.activeElement = element;
+      this.clearSuggestion();
+      this.isProcessing = true;
+      
+      try {
+        console.log('📧 EmailCopilot: Processing input for suggestion');
+        this.showProcessingIndicator(element);
+        
+        const context = this.getEmailContext(element);
+        const result = await this.suggestionEngine.getSuggestion(text, context);
+        
+        if (result.success && result.suggestion && this.activeElement === element) {
+          if (this.ghostRenderer.show(element, result.suggestion)) {
+            this.showSuggestionIndicator(element);
+            this.trackUsage('suggestion_shown');
+          }
+        } else if (result.error) {
+          console.warn('📧 EmailCopilot: Suggestion failed:', result.error);
+          this.showErrorIndicator(element, result.error);
+        }
+        
+      } catch (error) {
+        console.error('📧 EmailCopilot: Error processing input:', error);
+        this.showErrorIndicator(element, 'Failed to generate suggestion');
+      } finally {
+        this.isProcessing = false;
+        this.hideProcessingIndicator(element);
+      }
+    }
+
+    handleBackspace(element, event) {
+      // Clear suggestions when user is backspacing
+      this.clearSuggestion();
+    }
+
+    handleAccept(element) {
+      if (this.ghostRenderer.acceptSuggestion()) {
+        this.trackUsage('suggestion_accepted');
+        this.showStatusIndicator(element, 'Suggestion accepted');
+      }
+    }
+
+    handleReject(element) {
+      this.clearSuggestion();
+      this.trackUsage('suggestion_rejected');
+    }
+
+    async handleManualTrigger(element) {
+      if (!this.isEnabled || this.isProcessing) return;
+      
+      const text = this.inputManager.extractText(element);
+      if (text.length < 5) {
+        this.showStatusIndicator(element, 'Type more text to get suggestions');
+        return;
       }
       
-      // Insert the suggestion text
-      const textNode = document.createTextNode(text);
-      range.insertNode(textNode);
+      // Force suggestion even if conditions aren't met
+      this.handleInput(element, text, null);
+    }
+
+    clearSuggestion() {
+      this.ghostRenderer.hide();
+    }
+
+    clearAllSuggestions() {
+      this.clearSuggestion();
+      this.suggestionEngine.cancelPendingRequests();
+    }
+
+    getEmailContext(element) {
+      // Extract email context (subject, recipients, etc.)
+      let context = '';
       
-      // Move cursor after inserted text
-      range.setStartAfter(textNode);
-      range.setEndAfter(textNode);
-      selection.removeAllRanges();
-      selection.addRange(range);
+      try {
+        // Get subject
+        const subjectElement = document.querySelector('input[name="subjectbox"], input[aria-label*="subject" i]');
+        if (subjectElement?.value) {
+          context += `Subject: ${subjectElement.value}\n`;
+        }
+        
+        // Get recipients
+        const toElement = document.querySelector('input[name="to"], span[email] [email]');
+        if (toElement) {
+          const recipients = toElement.textContent || toElement.value || '';
+          if (recipients.trim()) {
+            context += `To: ${recipients}\n`;
+          }
+        }
+        
+        return context.trim();
+      } catch (error) {
+        console.warn('📧 Failed to extract email context:', error);
+        return '';
+      }
+    }
+
+    async getSettings() {
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'get_settings' });
+        return response?.success ? response.settings : {};
+      } catch (error) {
+        console.warn('📧 Failed to get settings:', error);
+        return {};
+      }
+    }
+
+    trackUsage(action) {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'track_usage',
+          action: action,
+          timestamp: Date.now()
+        });
+      } catch (error) {
+        // Ignore tracking errors
+      }
+    }
+
+    // UI Helper Methods
+    addComposeIndicators(element) {
+      // Add subtle indicator that Copilot is active
+      this.showStatusIndicator(element, 'AI Copilot Ready', 2000);
+    }
+
+    showStatusNotification(message) {
+      const notification = document.createElement('div');
+      notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: #4285f4;
+        color: white;
+        padding: 12px 16px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        z-index: 10000;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        font-family: 'Google Sans', 'Roboto', sans-serif;
+      `;
+      notification.textContent = `✨ ${message}`;
       
-      // Trigger input event to notify Gmail
-      this.activeComposeElement.dispatchEvent(new Event('input', { bubbles: true }));
-      this.activeComposeElement.dispatchEvent(new Event('change', { bubbles: true }));
+      document.body.appendChild(notification);
+      setTimeout(() => notification.remove(), 3000);
+    }
+
+    showStatusIndicator(element, message, duration = 5000) {
+      // Implementation for showing status messages near compose area
+      const indicator = document.createElement('div');
+      indicator.className = 'email-copilot-status-indicator';
+      indicator.textContent = message;
+      indicator.style.cssText = `
+        position: absolute;
+        top: -25px;
+        right: 5px;
+        background: #34a853;
+        color: white;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        z-index: 1000;
+        white-space: nowrap;
+      `;
+      
+      const container = element.parentElement;
+      if (container) {
+        container.style.position = 'relative';
+        container.appendChild(indicator);
+        setTimeout(() => indicator.remove(), duration);
+      }
+    }
+
+    showProcessingIndicator(element) {
+      this.showStatusIndicator(element, '🤖 Generating suggestion...', 0);
+    }
+
+    hideProcessingIndicator(element) {
+      const indicator = element.parentElement?.querySelector('.email-copilot-status-indicator');
+      if (indicator?.textContent.includes('Generating')) {
+        indicator.remove();
+      }
+    }
+
+    showSuggestionIndicator(element) {
+      this.showStatusIndicator(element, '💡 Press Tab to accept, Esc to dismiss');
+    }
+
+    showErrorIndicator(element, error) {
+      this.showStatusIndicator(element, `⚠️ ${error}`, 3000);
+    }
+
+    injectStyles() {
+      if (document.getElementById('email-copilot-styles')) return;
+      
+      const style = document.createElement('style');
+      style.id = 'email-copilot-styles';
+      style.textContent = `
+        .email-copilot-ghost-text {
+          color: #9ca3af !important;
+          background-color: rgba(66, 133, 244, 0.05) !important;
+          font-style: italic !important;
+          opacity: 0.75 !important;
+          pointer-events: none !important;
+          user-select: none !important;
+          border-radius: 2px !important;
+          padding: 0 2px !important;
+          border: 1px solid rgba(66, 133, 244, 0.15) !important;
+          display: inline !important;
+          white-space: pre-wrap !important;
+          transition: opacity 0.2s ease !important;
+        }
+        
+        .email-copilot-status-indicator {
+          font-family: 'Google Sans', 'Roboto', sans-serif !important;
+          font-weight: 500 !important;
+          animation: fadeInUp 0.3s ease !important;
+        }
+        
+        @keyframes fadeInUp {
+          from { opacity: 0; transform: translateY(5px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `;
+      
+      document.head.appendChild(style);
+    }
+
+    destroy() {
+      console.log('📧 EmailCopilot: Cleaning up...');
+      
+      this.gmailObserver.stop();
+      this.keyboardHandler.stopListening();
+      this.clearAllSuggestions();
+      
+      // Remove styles
+      const styles = document.getElementById('email-copilot-styles');
+      if (styles) styles.remove();
     }
   }
 
-  trackUsage(action) {
-    chrome.runtime.sendMessage({
-      type: 'track_usage',
-      action: action,
-      timestamp: Date.now()
-    });
-  }
+  // =============================================================================
+  // INITIALIZATION
+  // =============================================================================
 
-  setEnabled(enabled) {
-    this.isEnabled = enabled;
-    if (!enabled) {
-      this.hideSuggestion();
+  // Initialize Email Copilot when DOM is ready
+  function initializeEmailCopilot() {
+    // Wait for Gmail to be fully loaded
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        setTimeout(() => new EmailCopilot(), 1000);
+      });
+    } else {
+      setTimeout(() => new EmailCopilot(), 1000);
     }
   }
+
+  // Store reference globally for debugging
+  window.emailCopilot = null;
+  
+  // Initialize
+  initializeEmailCopilot();
 }
-
-// Initialize when DOM is ready
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    window.emailCopilotContent = new EmailCopilotContent();
-  });
-} else {
-  window.emailCopilotContent = new EmailCopilotContent();
-}
-
-// Also initialize after a short delay to ensure Gmail is loaded
-setTimeout(() => {
-  if (!window.emailCopilotContent) {
-    window.emailCopilotContent = new EmailCopilotContent();
-  }
-}, 2000);
