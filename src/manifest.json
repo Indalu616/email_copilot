@@ -18,8 +18,18 @@
     }
   ],
   "action": {
-    "default_popup": "popup/index.html",
-    "default_title": "Email Copilot Settings"
+    "default_popup": "src/popup/index.html",
+    "default_title": "Email Copilot Settings",
+    "default_icon": {
+    "16": "icons/icon16.svg",
+    "48": "icons/icon48.svg",
+    "128": "icons/icon128.svg"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.svg",
+    "48": "icons/icon48.svg",
+    "128": "icons/icon128.svg"
   },
   "web_accessible_resources": [
     {
