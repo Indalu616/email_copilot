@@ -38,6 +38,116 @@ function createStatusIndicator() {
   }, 3000);
 }
 
+// Add Copilot button to Gmail compose toolbar
+function addCopilotButton(composeElement) {
+  // Find the compose toolbar (formatting buttons area)
+  const toolbar = composeElement.closest('.M9').querySelector('.aoD.hl, .btC, .IZ');
+  if (!toolbar || toolbar.querySelector('.email-copilot-button')) return;
+
+  const copilotButton = document.createElement('div');
+  copilotButton.className = 'email-copilot-button';
+  copilotButton.innerHTML = `
+    <div style="
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 12px;
+      margin: 0 4px;
+      background: #f8f9fa;
+      border: 1px solid #dadce0;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: #5f6368;
+      font-family: 'Google Sans', 'Roboto', sans-serif;
+      transition: all 0.2s ease;
+      user-select: none;
+    " 
+    onmouseover="this.style.background='#e8f0fe'; this.style.borderColor='#4285f4'; this.style.color='#1a73e8';"
+    onmouseout="this.style.background='#f8f9fa'; this.style.borderColor='#dadce0'; this.style.color='#5f6368';"
+    onclick="this.dispatchEvent(new CustomEvent('copilot-trigger'));"
+    title="Trigger AI suggestion (Ctrl+Space)">
+      ✨ AI Copilot
+    </div>
+  `;
+
+  // Add click handler
+  copilotButton.addEventListener('copilot-trigger', () => {
+    if (window.emailCopilotContent && window.emailCopilotContent.activeComposeElement === composeElement) {
+      window.emailCopilotContent.getSuggestion(true);
+    }
+  });
+
+  toolbar.appendChild(copilotButton);
+  return copilotButton;
+}
+
+// Add status indicator to compose area
+function addComposeStatusIndicator(composeElement) {
+  const existingIndicator = composeElement.parentElement.querySelector('.email-copilot-status-bar');
+  if (existingIndicator) return existingIndicator;
+
+  const statusBar = document.createElement('div');
+  statusBar.className = 'email-copilot-status-bar';
+  statusBar.innerHTML = `
+    <div style="
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 8px;
+      margin: 4px 0;
+      background: linear-gradient(90deg, #e8f0fe 0%, #f8f9fa 100%);
+      border: 1px solid #e1e3e1;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      color: #5f6368;
+      font-family: 'Google Sans', 'Roboto', sans-serif;
+    ">
+      <span class="status-text">✨ AI Copilot Ready</span>
+      <span class="status-shortcut">Ctrl+Space to trigger</span>
+    </div>
+  `;
+
+  // Insert before the compose element
+  composeElement.parentElement.insertBefore(statusBar, composeElement);
+  return statusBar;
+}
+
+// Update status indicator
+function updateStatusIndicator(element, status, message) {
+  const statusBar = element?.closest('.M9')?.querySelector('.email-copilot-status-bar');
+  if (!statusBar) return;
+
+  const statusText = statusBar.querySelector('.status-text');
+  const statusShortcut = statusBar.querySelector('.status-shortcut');
+  
+  if (statusText && statusShortcut) {
+    switch (status) {
+      case 'ready':
+        statusText.textContent = '✨ AI Copilot Ready';
+        statusShortcut.textContent = 'Ctrl+Space to trigger';
+        statusBar.style.background = 'linear-gradient(90deg, #e8f0fe 0%, #f8f9fa 100%)';
+        break;
+      case 'thinking':
+        statusText.textContent = '🤖 Generating suggestion...';
+        statusShortcut.textContent = 'Please wait';
+        statusBar.style.background = 'linear-gradient(90deg, #fef7e0 0%, #f8f9fa 100%)';
+        break;
+      case 'suggestion':
+        statusText.textContent = '💡 Suggestion ready';
+        statusShortcut.textContent = 'Tab to accept, Esc to dismiss';
+        statusBar.style.background = 'linear-gradient(90deg, #e6f4ea 0%, #f8f9fa 100%)';
+        break;
+      case 'error':
+        statusText.textContent = '⚠️ ' + (message || 'Error occurred');
+        statusShortcut.textContent = 'Try Ctrl+Space';
+        statusBar.style.background = 'linear-gradient(90deg, #fce8e6 0%, #f8f9fa 100%)';
+        break;
+    }
+  }
+}
+
 // Gmail Observer class
 class GmailObserver {
   constructor() {
@@ -95,7 +205,8 @@ class GmailObserver {
       'div[contenteditable="true"][g_editable="true"]',
       '.Am.Al.editable',
       '.editable[contenteditable="true"]',
-      '[contenteditable="true"].Am'
+      '[contenteditable="true"].Am',
+      'div[contenteditable="true"]:not(.gmail_signature):not(.gmail_quote)'
     ];
 
     composeSelectors.forEach(selector => {
@@ -163,8 +274,11 @@ class GmailObserver {
     console.log('🎯 Gmail Observer: Compose element detected', element);
     this.observedElements.add(element);
 
-    // Add visual indicator
-    this.addComposeIndicator(element);
+    // Add UI integrations
+    setTimeout(() => {
+      addCopilotButton(element);
+      addComposeStatusIndicator(element);
+    }, 500);
 
     if (this.onComposeDetected) {
       try {
@@ -172,43 +286,6 @@ class GmailObserver {
       } catch (error) {
         console.error('Error in compose detected callback:', error);
       }
-    }
-  }
-
-  addComposeIndicator(element) {
-    // Add a small indicator to show the element is detected
-    const indicator = document.createElement('div');
-    indicator.className = 'email-copilot-compose-indicator';
-    indicator.innerHTML = '✨ AI';
-    indicator.style.cssText = `
-      position: absolute;
-      top: -25px;
-      right: 5px;
-      background: #34a853;
-      color: white;
-      padding: 2px 6px;
-      border-radius: 3px;
-      font-size: 10px;
-      font-weight: 500;
-      z-index: 1000;
-      pointer-events: none;
-      opacity: 0.8;
-    `;
-    
-    const container = element.parentElement;
-    if (container) {
-      const containerStyle = window.getComputedStyle(container);
-      if (containerStyle.position === 'static') {
-        container.style.position = 'relative';
-      }
-      container.appendChild(indicator);
-      
-      // Remove indicator after 5 seconds
-      setTimeout(() => {
-        if (indicator.parentNode) {
-          indicator.remove();
-        }
-      }, 5000);
     }
   }
 }
@@ -231,12 +308,11 @@ class GhostTextRenderer {
     
     this.createGhostElement(suggestion);
     this.positionGhostElement();
-    this.attachToElement();
     
     this.isVisible = true;
     
-    // Add loading indicator
-    this.showSuggestionIndicator();
+    // Update status indicator
+    updateStatusIndicator(targetElement, 'suggestion');
   }
 
   hide() {
@@ -245,8 +321,13 @@ class GhostTextRenderer {
       this.ghostElement = null;
     }
     
-    this.hideSuggestionIndicator();
     this.isVisible = false;
+    
+    // Update status indicator
+    if (this.targetElement) {
+      updateStatusIndicator(this.targetElement, 'ready');
+    }
+    
     this.targetElement = null;
   }
 
@@ -258,13 +339,15 @@ class GhostTextRenderer {
     // Enhanced styling
     this.ghostElement.style.cssText = `
       color: #9ca3af !important;
-      background: rgba(156, 163, 175, 0.1) !important;
+      background: rgba(66, 133, 244, 0.08) !important;
       font-style: italic !important;
-      opacity: 0.7 !important;
+      opacity: 0.8 !important;
       pointer-events: none !important;
       user-select: none !important;
-      border-radius: 2px !important;
-      padding: 0 2px !important;
+      border-radius: 3px !important;
+      padding: 1px 3px !important;
+      margin: 0 1px !important;
+      border: 1px solid rgba(66, 133, 244, 0.2) !important;
     `;
   }
 
@@ -294,51 +377,6 @@ class GhostTextRenderer {
     } else {
       // Fallback: append to end
       this.targetElement.appendChild(this.ghostElement);
-    }
-  }
-
-  attachToElement() {
-    // Ghost text is already attached via positioning
-  }
-
-  showSuggestionIndicator() {
-    if (!this.targetElement) return;
-    
-    const indicator = document.createElement('div');
-    indicator.className = 'email-copilot-suggestion-indicator';
-    indicator.textContent = 'AI suggestion - Press Tab to accept, Esc to dismiss';
-    indicator.style.cssText = `
-      position: absolute;
-      top: -30px;
-      right: 0;
-      background: #4285f4;
-      color: white;
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 500;
-      z-index: 10000;
-      white-space: nowrap;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-      animation: slideDown 0.3s ease;
-    `;
-
-    let container = this.targetElement.parentElement;
-    while (container && window.getComputedStyle(container).position === 'static') {
-      container.style.position = 'relative';
-      break;
-    }
-    
-    if (container) {
-      container.appendChild(indicator);
-      this.suggestionIndicator = indicator;
-    }
-  }
-
-  hideSuggestionIndicator() {
-    if (this.suggestionIndicator && this.suggestionIndicator.parentNode) {
-      this.suggestionIndicator.remove();
-      this.suggestionIndicator = null;
     }
   }
 }
@@ -455,37 +493,27 @@ class EmailCopilotContent {
     }
   }
 
-  /**
-   * Setup keyboard event handlers
-   */
   setupKeyboardHandlers() {
-    // Set up accept suggestion callback
     this.keybindManager.setAcceptCallback(() => {
       this.acceptSuggestion();
     });
 
-    // Set up reject suggestion callback
     this.keybindManager.setRejectCallback(() => {
       this.rejectSuggestion();
     });
 
-    // Set up manual trigger callback
     this.keybindManager.setTriggerCallback((event) => {
       if (this.activeComposeElement) {
         console.log('🎯 Manual trigger activated');
-        this.getSuggestion(true); // Force suggestion
+        this.getSuggestion(true);
       }
     });
 
-    // Listen for keyboard events
     document.addEventListener('keydown', (event) => {
       this.keybindManager.handleKeyEvent(event);
     });
   }
 
-  /**
-   * Setup Gmail-specific DOM observer
-   */
   setupGmailObserver() {
     this.gmailObserver.onComposeDetected = (composeElement) => {
       this.attachToComposeElement(composeElement);
@@ -496,59 +524,43 @@ class EmailCopilotContent {
     };
   }
 
-  /**
-   * Inject necessary CSS styles
-   */
   injectStyles() {
     const style = document.createElement('style');
     style.textContent = `
       .email-copilot-ghost-text {
         color: #9ca3af !important;
-        background: rgba(156, 163, 175, 0.1) !important;
+        background: rgba(66, 133, 244, 0.08) !important;
         font-style: italic !important;
-        opacity: 0.7 !important;
+        opacity: 0.8 !important;
         pointer-events: none !important;
         user-select: none !important;
-        border-radius: 2px !important;
-        padding: 0 2px !important;
+        border-radius: 3px !important;
+        padding: 1px 3px !important;
+        margin: 0 1px !important;
+        border: 1px solid rgba(66, 133, 244, 0.2) !important;
+        transition: all 0.2s ease !important;
       }
 
       .email-copilot-compose-wrapper {
         position: relative !important;
       }
 
-      .email-copilot-suggestion-indicator {
-        position: absolute !important;
-        z-index: 10000 !important;
-        font-family: 'Google Sans', 'Roboto', sans-serif !important;
+      .email-copilot-button:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
       }
 
-      .email-copilot-compose-indicator {
-        font-family: 'Google Sans', 'Roboto', sans-serif !important;
+      .email-copilot-status-bar {
+        transition: all 0.3s ease !important;
       }
 
-      @keyframes slideDown {
-        from { opacity: 0; transform: translateY(-5px); }
-        to { opacity: 1; transform: translateY(0); }
-      }
-
-      .email-copilot-typing-indicator {
-        position: absolute;
-        top: -20px;
-        right: 30px;
-        background: #fbbc04;
-        color: #333;
-        padding: 2px 6px;
-        border-radius: 3px;
-        font-size: 10px;
-        font-weight: 500;
-        z-index: 10000;
-        animation: pulse 1s infinite;
-      }
-
-      @keyframes pulse {
-        0%, 100% { opacity: 0.7; }
+      @keyframes emailCopilotPulse {
+        0%, 100% { opacity: 0.8; }
         50% { opacity: 1; }
+      }
+
+      .email-copilot-thinking .status-text {
+        animation: emailCopilotPulse 1.5s infinite !important;
       }
     `;
     document.head.appendChild(style);
@@ -617,8 +629,12 @@ class EmailCopilotContent {
     element.addEventListener('blur', this.handleBlur.bind(this));
     element.addEventListener('click', this.handleClick.bind(this));
     
-    // Show attachment success
-    this.showTypingIndicator(element, 'Connected! Start typing...');
+    // Add UI elements
+    setTimeout(() => {
+      addCopilotButton(element);
+      const statusBar = addComposeStatusIndicator(element);
+      updateStatusIndicator(element, 'ready');
+    }, 100);
   }
 
   detachFromComposeElement(element) {
@@ -647,8 +663,8 @@ class EmailCopilotContent {
     // Hide current suggestion
     this.hideSuggestion();
     
-    // Show typing indicator
-    this.showTypingIndicator(element, 'Thinking...');
+    // Update status
+    updateStatusIndicator(element, 'thinking');
     
     // Get new suggestion after a delay
     this.debouncedGetSuggestion();
@@ -673,6 +689,7 @@ class EmailCopilotContent {
     
     console.log('🎯 Focus on compose element');
     this.activeComposeElement = element;
+    updateStatusIndicator(element, 'ready');
   }
 
   handleBlur(event) {
@@ -704,18 +721,19 @@ class EmailCopilotContent {
       if (!force) {
         if (!partialText || partialText.trim().length < 5) {
           console.log('⚠️ Text too short, skipping suggestion');
-          this.hideTypingIndicator();
+          updateStatusIndicator(this.activeComposeElement, 'ready');
           return;
         }
         
         if (!this.isCursorAtWordEnd()) {
           console.log('⚠️ Not at word end, skipping suggestion');
-          this.hideTypingIndicator();
+          updateStatusIndicator(this.activeComposeElement, 'ready');
           return;
         }
       }
       
       console.log('🤖 Requesting AI completion...');
+      updateStatusIndicator(this.activeComposeElement, 'thinking');
       
       // Call background script for AI completion
       const response = await chrome.runtime.sendMessage({
@@ -724,46 +742,16 @@ class EmailCopilotContent {
         partialText: partialText
       });
       
-      this.hideTypingIndicator();
-      
       if (response && response.success && response.suggestion) {
         console.log('✅ Received suggestion:', response.suggestion);
         this.showSuggestion(response.suggestion.trim());
       } else {
         console.log('❌ No suggestion received:', response);
+        updateStatusIndicator(this.activeComposeElement, 'error', response?.error || 'No suggestion');
       }
     } catch (error) {
       console.error('❌ Failed to get suggestion:', error);
-      this.hideTypingIndicator();
-    }
-  }
-
-  showTypingIndicator(element, text) {
-    this.hideTypingIndicator();
-    
-    const indicator = document.createElement('div');
-    indicator.className = 'email-copilot-typing-indicator';
-    indicator.textContent = text;
-    
-    const container = element.parentElement;
-    if (container) {
-      const containerStyle = window.getComputedStyle(container);
-      if (containerStyle.position === 'static') {
-        container.style.position = 'relative';
-      }
-      container.appendChild(indicator);
-      this.typingIndicator = indicator;
-      
-      if (text === 'Connected! Start typing...') {
-        setTimeout(() => this.hideTypingIndicator(), 2000);
-      }
-    }
-  }
-
-  hideTypingIndicator() {
-    if (this.typingIndicator && this.typingIndicator.parentNode) {
-      this.typingIndicator.remove();
-      this.typingIndicator = null;
+      updateStatusIndicator(this.activeComposeElement, 'error', 'Connection failed');
     }
   }
 
@@ -799,7 +787,7 @@ class EmailCopilotContent {
   }
 
   isCursorAtWordEnd() {
-    if (!this.activeComposeElement) return true; // Allow if we can't determine
+    if (!this.activeComposeElement) return true;
     
     const selection = window.getSelection();
     if (selection.rangeCount === 0) return true;
@@ -815,7 +803,6 @@ class EmailCopilotContent {
     const charBefore = text.charAt(offset - 1);
     const charAfter = text.charAt(offset);
     
-    // More lenient word end detection
     return /\w/.test(charBefore) && (/\s/.test(charAfter) || charAfter === '' || /[.!?,;:]/.test(charAfter));
   }
 
@@ -850,6 +837,9 @@ class EmailCopilotContent {
     this.currentSuggestion = null;
     this.keybindManager.setSuggestionVisible(false);
     
+    // Update status
+    updateStatusIndicator(this.activeComposeElement, 'ready');
+    
     // Track usage
     this.trackUsage('accept');
   }
@@ -860,6 +850,7 @@ class EmailCopilotContent {
     console.log('❌ Rejecting suggestion');
     
     this.hideSuggestion();
+    updateStatusIndicator(this.activeComposeElement, 'ready');
     this.trackUsage('reject');
   }
 
@@ -911,10 +902,10 @@ class EmailCopilotContent {
 // Initialize when DOM is ready
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => {
-    new EmailCopilotContent();
+    window.emailCopilotContent = new EmailCopilotContent();
   });
 } else {
-  new EmailCopilotContent();
+  window.emailCopilotContent = new EmailCopilotContent();
 }
 
 // Also initialize after a short delay to ensure Gmail is loaded
