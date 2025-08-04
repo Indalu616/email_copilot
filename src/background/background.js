@@ -13,7 +13,7 @@ chrome.runtime.onInstalled.addListener((details) => {
     
     // Open welcome page or settings
     chrome.tabs.create({
-      url: chrome.runtime.getURL('popup/index.html')
+      url: chrome.runtime.getURL('src/popup/index.html')
     });
   }
 });
@@ -46,6 +46,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       handleTestApiConnection(message, sendResponse);
       return true; // Keep message channel open for async response
       
+    case 'get_ai_completion':
+      handleGetAICompletion(message, sendResponse);
+      return true; // Keep message channel open for async response
+      
     case 'track_usage':
       handleTrackUsage(message);
       break;
@@ -58,6 +62,183 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.log('Background: Unknown message type:', message.type);
   }
 });
+
+// Handle AI completion requests from content script
+async function handleGetAICompletion(message, sendResponse) {
+  try {
+    const { context, partialText } = message;
+    
+    // Get current settings
+    const settings = await chrome.storage.sync.get([
+      'enabled', 'aiProvider', 'apiKey', 'model'
+    ]);
+    
+    if (!settings.enabled) {
+      sendResponse({ success: false, error: 'Extension is disabled' });
+      return;
+    }
+    
+    if (!settings.apiKey) {
+      sendResponse({ success: false, error: 'API key not configured' });
+      return;
+    }
+    
+    // Get completion from AI
+    const result = await getAICompletion(
+      settings.aiProvider, 
+      settings.apiKey, 
+      settings.model,
+      context,
+      partialText
+    );
+    
+    if (result.success) {
+      sendResponse({ success: true, suggestion: result.suggestion });
+    } else {
+      sendResponse({ success: false, error: result.error });
+    }
+  } catch (error) {
+    console.error('Background: AI completion failed:', error);
+    sendResponse({ success: false, error: error.message });
+  }
+}
+
+// Get AI completion
+async function getAICompletion(provider, apiKey, model, context, partialText) {
+  const prompt = buildEmailPrompt(context, partialText);
+  
+  try {
+    if (provider === 'gemini') {
+      return await getGeminiCompletion(apiKey, prompt);
+    } else if (provider === 'openai') {
+      return await getOpenAICompletion(apiKey, model, prompt);
+    } else {
+      throw new Error('Unsupported AI provider');
+    }
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Build email completion prompt
+function buildEmailPrompt(context, partialText) {
+  return `You are an intelligent email writing assistant. Complete the following email text naturally and professionally.
+
+Context: ${context}
+
+Partial text: "${partialText}"
+
+Rules:
+- Provide ONLY the completion text, not the full email
+- Keep it concise and contextually appropriate
+- Match the writing tone and style
+- Don't repeat the partial text
+- Limit to 1-2 sentences maximum
+- If unsure, provide a short, safe completion
+
+Completion:`;
+}
+
+// Get Gemini completion
+async function getGeminiCompletion(apiKey, prompt) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: prompt
+          }]
+        }],
+        generationConfig: {
+          maxOutputTokens: 100,
+          temperature: 0.7,
+          stopSequences: ['\n\n', 'Context:', 'Partial text:']
+        }
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    
+    if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
+      const suggestion = cleanCompletion(data.candidates[0].content.parts[0].text);
+      return { success: true, suggestion };
+    } else {
+      throw new Error('Invalid response from Gemini API');
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout - check your internet connection');
+    }
+    throw error;
+  }
+}
+
+// Get OpenAI completion
+async function getOpenAICompletion(apiKey, model, prompt) {
+  const endpoint = 'https://api.openai.com/v1/chat/completions';
+  
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: model || 'gpt-4',
+        messages: [{
+          role: 'user',
+          content: prompt
+        }],
+        max_tokens: 100,
+        temperature: 0.7,
+        stop: ['\n\n', 'Context:', 'Partial text:']
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    
+    if (data.choices && data.choices[0]?.message?.content) {
+      const suggestion = cleanCompletion(data.choices[0].message.content);
+      return { success: true, suggestion };
+    } else {
+      throw new Error('Invalid response from OpenAI API');
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout - check your internet connection');
+    }
+    throw error;
+  }
+}
+
+// Clean completion text
+function cleanCompletion(text) {
+  return text
+    .trim()
+    .replace(/^(Completion:|Response:)/i, '')
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 // Handle API connection testing
 async function handleTestApiConnection(message, sendResponse) {

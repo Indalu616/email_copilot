@@ -28,7 +28,7 @@
     }
   ],
   "action": {
-    "default_popup": "popup/index.html",
+    "default_popup": "src/popup/index.html",
     "default_title": "Email Copilot Settings",
     "default_icon": {
       "16": "icons/icon16.png",
